@@ -175,6 +175,17 @@ def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
     return DMD2SigmaSchedule.from_metadata(release)
 
 
+def _read_sampling_mode(release: Mapping[str, Any]) -> str:
+    """Read the distilled trajectory type while preserving legacy ODE behavior."""
+    raw = release.get("sampling_mode", "ode")
+    if not isinstance(raw, str):
+        raise ValueError("MiniMax H3 sampling_mode must be a string")
+    mode = raw.lower()
+    if mode not in {"ode", "sde"}:
+        raise ValueError(f"MiniMax H3 sampling_mode must be 'ode' or 'sde', got {raw!r}")
+    return mode
+
+
 def _resolve_component_quant_config(quant_config, component: str):
     if hasattr(quant_config, "resolve"):
         return quant_config.resolve(component)
@@ -552,6 +563,7 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+    _sampling_mode_by_partition: ClassVar[Mapping[str, str]] = {}
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -619,9 +631,19 @@ class MiniMaxH3Pipeline(
         # uniform schedule derived from num_inference_steps does not match what
         # such a checkpoint was trained on. Each partition carries its own
         # contract, so a distilled FL2VA must not drag Ref2VA onto its schedule.
-        self._base_schedule_by_partition = {expected_partition: _read_base_schedule(release)}
+        schedule = _read_base_schedule(release)
+        sampling_mode = _read_sampling_mode(release)
+        if sampling_mode == "sde" and schedule is None:
+            raise ValueError("MiniMax H3 sampling_mode='sde' requires a base_schedule")
+        self._base_schedule_by_partition = {expected_partition: schedule}
+        self._sampling_mode_by_partition = {expected_partition: sampling_mode}
         if ref2va_model_path is not None:
-            self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
+            ref2va_schedule = _read_base_schedule(ref2va_release)
+            ref2va_sampling_mode = _read_sampling_mode(ref2va_release)
+            if ref2va_sampling_mode == "sde" and ref2va_schedule is None:
+                raise ValueError("MiniMax H3 Ref2VA sampling_mode='sde' requires a base_schedule")
+            self._base_schedule_by_partition["ref2va"] = ref2va_schedule
+            self._sampling_mode_by_partition["ref2va"] = ref2va_sampling_mode
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -759,6 +781,11 @@ class MiniMaxH3Pipeline(
         """Return the distilled schedule of the partition that serves ``task``."""
         partition = "ref2va" if task == "ref2va" else "fl2va"
         return self._base_schedule_by_partition.get(partition)
+
+    def _sampling_mode_for_task(self, task: str) -> str:
+        """Return the trajectory type of the partition that serves ``task``."""
+        partition = "ref2va" if task == "ref2va" else "fl2va"
+        return self._sampling_mode_by_partition.get(partition, "ode")
 
     def _resolve_task(
         self,
@@ -1368,13 +1395,13 @@ class MiniMaxH3Pipeline(
     def _initial_noise(
         self,
         *,
-        seed: int,
         latent_t: int,
         latent_h: int,
         latent_w: int,
         audio_t: int,
+        video_generator: torch.Generator,
+        audio_generator: torch.Generator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        video_generator = torch.Generator(device="cpu").manual_seed(seed)
         video = torch.randn(
             1,
             24,
@@ -1388,7 +1415,6 @@ class MiniMaxH3Pipeline(
             video,
             patch_size=(1, 2, 2),
         )
-        audio_generator = torch.Generator(device="cpu").manual_seed(seed)
         audio_rows = torch.randn(
             audio_t * 2,
             32,
@@ -1424,6 +1450,7 @@ class MiniMaxH3Pipeline(
         video_shift: float,
         audio_shift: float,
         base_schedule: Sequence[float] | None,
+        sampling_mode: str,
         visual_condition: torch.Tensor | None,
         visual_condition_shape: tuple[int, int, int] | None,
         audio_condition: torch.Tensor | None,
@@ -1433,12 +1460,15 @@ class MiniMaxH3Pipeline(
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        video_generator = torch.Generator(device="cpu").manual_seed(seed)
+        audio_generator = torch.Generator(device="cpu").manual_seed(seed)
         initial_video, initial_audio = self._initial_noise(
-            seed=seed,
             latent_t=latent_t,
             latent_h=latent_h,
             latent_w=latent_w,
             audio_t=audio_t,
+            video_generator=video_generator,
+            audio_generator=audio_generator,
         )
         if task == "ref2va":
             if ref_blocks is None:
@@ -1549,6 +1579,9 @@ class MiniMaxH3Pipeline(
                     sigmas_video=video_sigmas,
                     sigmas_audio=audio_sigmas,
                     device=self.device,
+                    sampling_mode=sampling_mode,
+                    video_generator=video_generator,
+                    audio_generator=audio_generator,
                     imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
                     audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
                     on_step_start=lambda step, video_sigma, audio_sigma: self.record_denoise_step(
@@ -1798,12 +1831,14 @@ class MiniMaxH3Pipeline(
         sigma_schedule = self._base_schedule_for_task(task)
         if sigma_schedule is None:
             base_schedule = None
+            sampling_mode = "ode"
             num_steps = int(sampling.num_inference_steps or 50)
         else:
             # The schedule lists sigma boundaries; the denoise loop runs one
             # step per interval, and that count is what requests and Cache-DiT
             # speak in.
             base_schedule = sigma_schedule.base_schedule
+            sampling_mode = self._sampling_mode_for_task(task)
             num_steps = sigma_schedule.num_inference_steps
             requested_steps = sampling.num_inference_steps
             if requested_steps is not None and int(requested_steps) != num_steps:
@@ -1837,6 +1872,7 @@ class MiniMaxH3Pipeline(
                 video_shift=video_shift,
                 audio_shift=audio_shift,
                 base_schedule=base_schedule,
+                sampling_mode=sampling_mode,
                 visual_condition=visual_condition,
                 visual_condition_shape=visual_shape,
                 audio_condition=audio_condition,

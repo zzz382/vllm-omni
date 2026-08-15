@@ -2,8 +2,8 @@
 """MiniMax H3 cfg-distilled full denoise loop.
 
 Per step, the positive presentation is forwarded exactly once. Video and audio
-target rows chain through the Euler-eta0 update while visual and audio condition
-rows stay pinned to their noised step-0 anchors.
+target rows use either the released Euler-eta0 update or the DMD simulate SDE
+update, while condition rows stay pinned to their noised step-0 anchors.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
+    minimax_h3_sde_step,
 )
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
@@ -147,6 +148,9 @@ def minimax_h3_denoise_loop(
     sigmas_video: list[float],
     sigmas_audio: list[float],
     device: torch.device,
+    sampling_mode: str = "ode",
+    video_generator: torch.Generator | None = None,
+    audio_generator: torch.Generator | None = None,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     on_step_end: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
@@ -164,6 +168,10 @@ def minimax_h3_denoise_loop(
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
+    if sampling_mode not in {"ode", "sde"}:
+        raise ValueError(f"MiniMax H3 sampling_mode must be 'ode' or 'sde', got {sampling_mode!r}")
+    if sampling_mode == "sde" and (video_generator is None or audio_generator is None):
+        raise ValueError("MiniMax H3 SDE sampling requires video and audio generators")
     n_cond = int((~positive.update_mask).sum())
     if keyframe_cond_rows is None:
         if n_cond != 0:
@@ -232,7 +240,20 @@ def minimax_h3_denoise_loop(
                 mv_video_t,
                 torch.tensor(t_v, dtype=torch.float32, device=device),
             )
-            new_target = minimax_h3_euler_eta0_step(video_rows[update], x0_video, sigma_curr=s_v, sigma_next=s_v_next)
+            if sampling_mode == "sde":
+                assert video_generator is not None
+                new_target = minimax_h3_sde_step(
+                    x0_video,
+                    sigma_next=s_v_next,
+                    generator=video_generator,
+                )
+            else:
+                new_target = minimax_h3_euler_eta0_step(
+                    video_rows[update],
+                    x0_video,
+                    sigma_curr=s_v,
+                    sigma_next=s_v_next,
+                )
             video_rows = video_rows.clone()
             video_rows[update] = new_target
             if cond_anchor is not None:
@@ -243,9 +264,20 @@ def minimax_h3_denoise_loop(
                 mv_audio_t,
                 torch.tensor(t_a, dtype=torch.float32, device=device),
             )
-            new_audio = minimax_h3_euler_eta0_step(
-                audio_rows[audio_update], x0_audio, sigma_curr=s_a, sigma_next=s_a_next
-            )
+            if sampling_mode == "sde":
+                assert audio_generator is not None
+                new_audio = minimax_h3_sde_step(
+                    x0_audio,
+                    sigma_next=s_a_next,
+                    generator=audio_generator,
+                )
+            else:
+                new_audio = minimax_h3_euler_eta0_step(
+                    audio_rows[audio_update],
+                    x0_audio,
+                    sigma_curr=s_a,
+                    sigma_next=s_a_next,
+                )
             audio_rows = audio_rows.clone()
             audio_rows[audio_update] = new_audio
             if audio_anchor is not None:

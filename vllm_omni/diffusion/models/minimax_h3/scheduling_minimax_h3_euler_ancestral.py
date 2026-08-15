@@ -102,6 +102,36 @@ def minimax_h3_euler_eta0_step(
     return out
 
 
+def minimax_h3_sde_step(
+    denoised: torch.Tensor,
+    *,
+    sigma_next: float,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Re-noise a clean prediction at the next DMD simulate node."""
+    if not torch.is_floating_point(denoised):
+        raise ValueError("denoised must be a floating point tensor")
+    _require_finite_tensor(denoised, "denoised")
+    sigma = _validate_sigma(sigma_next, "sigma_next")
+    if sigma > 1.0:
+        raise ValueError("sigma_next must be in [0, 1]")
+    if sigma == 0.0:
+        return denoised
+
+    # Generate on CPU so every sequence-parallel rank advances an identical
+    # device-independent RNG stream, then transfer only the sampled tensor.
+    noise = torch.randn(
+        denoised.shape,
+        generator=generator,
+        device="cpu",
+        dtype=torch.float32,
+    ).to(device=denoised.device, dtype=denoised.dtype)
+    sigma_t = denoised.new_tensor(sigma)
+    out = (1.0 - sigma_t) * denoised + sigma_t * noise
+    _require_finite_tensor(out, "sde_step output")
+    return out
+
+
 class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
     def __init__(self, **config: Any) -> None:
         if config:
@@ -176,4 +206,5 @@ __all__ = [
     "MiniMaxH3EulerAncestralEta0SchedulerAdapter",
     "minimax_h3_euler_eta0_step",
     "minimax_h3_rf_v_to_x0",
+    "minimax_h3_sde_step",
 ]

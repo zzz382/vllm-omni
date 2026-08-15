@@ -511,6 +511,30 @@ def test_base_schedule_overrides_the_uniform_sigma_positions():
     )
 
 
+def test_sde_step_matches_forward_process_and_returns_clean_terminal():
+    from vllm_omni.diffusion.models.minimax_h3.scheduling_minimax_h3_euler_ancestral import (
+        minimax_h3_sde_step,
+    )
+
+    clean = torch.tensor([[2.0, -1.0]], dtype=torch.float32)
+    expected_generator = torch.Generator("cpu").manual_seed(7)
+    noise = torch.randn(clean.shape, generator=expected_generator)
+    expected = 0.25 * clean + 0.75 * noise
+
+    actual = minimax_h3_sde_step(
+        clean,
+        sigma_next=0.75,
+        generator=torch.Generator("cpu").manual_seed(7),
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert minimax_h3_sde_step(
+        clean,
+        sigma_next=0.0,
+        generator=torch.Generator("cpu").manual_seed(7),
+    ) is clean
+
+
 @pytest.mark.parametrize(
     "base_schedule",
     [
@@ -536,7 +560,7 @@ def test_base_schedule_rejects_malformed_positions(base_schedule):
         )
 
 
-def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
+def _distilled_pipeline(diffuse_calls, base_schedule_by_partition, sampling_mode_by_partition=None):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.sched import DMD2SigmaSchedule
 
@@ -553,6 +577,10 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace()
     pipeline._base_schedule_by_partition = schedules
+    pipeline._sampling_mode_by_partition = {
+        partition: (sampling_mode_by_partition or {}).get(partition, "ode")
+        for partition in base_schedule_by_partition
+    }
     pipeline._quality_policy = Mock()
     pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=None)
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: None)
@@ -623,6 +651,7 @@ def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
     pipeline.forward(_t2va_batch())
 
     assert diffuse_calls[0]["base_schedule"] == tuple(base_schedule)
+    assert diffuse_calls[0]["sampling_mode"] == "ode"
     # Five boundaries describe four denoising steps.
     assert diffuse_calls[0]["num_steps"] == 4
     pipeline._quality_policy.resolve.assert_called_once_with(
@@ -630,6 +659,20 @@ def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
         num_inference_steps=4,
         extra_args={"task": "t2va", "aspect_ratio": "16:9"},
     )
+
+
+def test_distilled_forward_passes_partition_sde_sampling_mode():
+    diffuse_calls = []
+    base_schedule = [1.0, 0.75, 0.5, 0.25, 0.0]
+    pipeline = _distilled_pipeline(
+        diffuse_calls,
+        {"fl2va": base_schedule, "ref2va": None},
+        {"fl2va": "sde", "ref2va": "ode"},
+    )
+
+    pipeline.forward(_t2va_batch())
+
+    assert diffuse_calls[0]["sampling_mode"] == "sde"
 
 
 def test_distilled_forward_accepts_the_matching_explicit_step_count():
@@ -659,6 +702,32 @@ def test_absent_base_schedule_key_differs_from_an_empty_list():
     assert _read_base_schedule({"base_schedule": [1.0, 0.5, 0.0]}).base_schedule == (1.0, 0.5, 0.0)
     with pytest.raises(ValueError):
         _read_base_schedule({"base_schedule": []})
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({}, "ode"),
+        ({"sampling_mode": "ODE"}, "ode"),
+        ({"sampling_mode": "sde"}, "sde"),
+    ],
+)
+def test_sampling_mode_metadata(metadata, expected):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _read_sampling_mode,
+    )
+
+    assert _read_sampling_mode(metadata) == expected
+
+
+@pytest.mark.parametrize("value", ["simulate", "ancestral", 1, None])
+def test_sampling_mode_metadata_rejects_unknown_values(value):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _read_sampling_mode,
+    )
+
+    with pytest.raises(ValueError, match="sampling_mode"):
+        _read_sampling_mode({"sampling_mode": value})
 
 
 def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
