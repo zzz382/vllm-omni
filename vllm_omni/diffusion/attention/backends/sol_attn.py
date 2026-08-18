@@ -86,7 +86,11 @@ def _sol_attn_torch_impl(
     k_indices = torch.arange(k_blocks, device=query.device)
     q_global = query_offset + torch.arange(q_blocks, device=query.device) * block_size
     local = (q_global[:, None] - k_indices[None, :] * block_size).abs() <= block_size
-    sink = (k_indices[None, :] * block_size < prefix_len) if prefix_len > 0 else torch.zeros_like(local)
+    sink = (
+        k_indices * block_size < prefix_len
+        if prefix_len > 0
+        else torch.zeros_like(k_indices, dtype=torch.bool)
+    )
     route = route | local[None, :, None, :] | sink[None, None, None, :]
 
     max_exact_blocks = min(max_exact_blocks, k_blocks)
