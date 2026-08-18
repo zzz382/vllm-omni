@@ -1594,13 +1594,13 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant"}
+        spec_keys = {"backend", "skip_softmax", "quant", "sol_attn"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:
             if not node_keys <= spec_keys:
                 raise ValueError(
-                    f"Invalid per_role entry for role {role!r}: cannot mix backend/skip_softmax with nested role keys."
+                    f"Invalid per_role entry for role {role!r}: cannot mix attention-spec fields with nested role keys."
                 )
             normalized[role] = node_dict
             return

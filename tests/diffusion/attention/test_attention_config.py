@@ -121,6 +121,19 @@ class TestAttentionConfig:
         assert config.per_role["self"].skip_softmax.target_sparsity == 0.5
         assert config.per_role["cross"].backend == "SAGE_ATTN"
 
+    def test_constructor_accepts_sol_attn_role_config(self):
+        config = AttentionConfig(
+            per_role={
+                "hunyuan_image": {
+                    "backend": "SOL_ATTN",
+                    "sol_attn": {"tau": 1.0, "max_exact_blocks": 32, "compile": True},
+                }
+            }
+        )
+        spec, _ = config.resolve_with_source(role="hunyuan_image")
+        assert spec.backend == "SOL_ATTN"
+        assert spec.backend_kwargs() == {"tau": 1.0, "max_exact_blocks": 32, "compile": True}
+
     def test_constructor_flattens_nested_per_role_tree(self):
         config = AttentionConfig(
             per_role={
