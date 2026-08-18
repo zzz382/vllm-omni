@@ -1462,6 +1462,7 @@ class AttentionSpec:
     backend: str
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
+    sol_attn: dict[str, Any] | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -1469,6 +1470,17 @@ class AttentionSpec:
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
+        if self.sol_attn is not None:
+            if self.backend.upper() != "SOL_ATTN":
+                raise ValueError(
+                    f"sol_attn is only supported by the SOL_ATTN backend, but backend={self.backend!r}."
+                )
+            if not isinstance(self.sol_attn, Mapping):
+                raise TypeError(f"Expected dict for sol_attn, got {type(self.sol_attn)!r}")
+            allowed = {"tau", "max_exact_blocks", "compile"}
+            unknown = set(self.sol_attn) - allowed
+            if unknown:
+                raise ValueError(f"Unknown sol_attn options: {sorted(unknown)}")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -1511,6 +1523,8 @@ class AttentionSpec:
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
             kw["quant"] = quant_kw
+        if self.sol_attn is not None:
+            kw.update(self.sol_attn)
         return kw or None
 
 

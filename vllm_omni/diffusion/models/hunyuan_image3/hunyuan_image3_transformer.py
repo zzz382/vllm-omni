@@ -953,6 +953,8 @@ class ImageKVCacheManager:
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn" if prefix else "",
+            role="hunyuan_image",
+            qkv_layout="BSND",
         )
 
     @staticmethod
@@ -1172,9 +1174,20 @@ class ImageKVCacheManager:
         full_attn_spans = kwargs.get("full_attn_spans", None)
 
         if self.sp_size <= 1:
+            # The first step mixes text and image queries and carries an
+            # explicit mask.  Later steps have image-only queries over a
+            # contiguous [cached prefix | current image] KV sequence, which
+            # is the rectangular layout accepted by Sol-Attn.
+            sol_enabled = not first_step and not uncond_cfg_prefill and key.shape[1] > query.shape[1]
+            prefix_len = key.shape[1] - query.shape[1] if sol_enabled else 0
             attn_metadata = AttentionMetadata(
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                extra={
+                    "sol_attn_enabled": sol_enabled,
+                    "sol_attn_prefix_len": prefix_len,
+                    "sol_attn_query_offset": prefix_len,
+                },
             )
         else:
             attn_metadata = AttentionMetadata(

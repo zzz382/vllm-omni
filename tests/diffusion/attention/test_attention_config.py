@@ -78,6 +78,17 @@ class TestAttentionSpec:
         ).backend_kwargs()
         assert bk["target_sparsity"] == 0.5 and bk["quant"]["dtype_qk"] == "int8"
 
+    def test_sol_attn_config_serialized(self):
+        spec = AttentionSpec(
+            backend="SOL_ATTN",
+            sol_attn={"tau": 1.2, "max_exact_blocks": 16, "compile": True},
+        )
+        assert spec.backend_kwargs() == {"tau": 1.2, "max_exact_blocks": 16, "compile": True}
+
+    def test_sol_attn_config_rejected_on_other_backend(self):
+        with pytest.raises(ValueError, match="only supported by the SOL_ATTN"):
+            AttentionSpec(backend="FLASH_ATTN", sol_attn={"tau": 1.2})
+
     @pytest.mark.parametrize(
         "spec, match",
         [

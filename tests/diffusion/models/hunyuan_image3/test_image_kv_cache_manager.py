@@ -37,6 +37,7 @@ class MockAttention(nn.Module):
         super().__init__()
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
+        self.last_metadata = attn_metadata
         return query
 
 
@@ -187,6 +188,42 @@ def test_no_ar_kv(bs):
             result_k[b, prompt_len : prompt_len + img_q_len],
             new_img_k[img_offset : img_offset + img_q_len],
         )
+
+
+def test_sol_attn_metadata_only_enables_after_prompt_kv_reuse():
+    """Only the later rectangular image-query path may use Sol-Attn."""
+    mgr = _make_cache_mgr()
+    prompt_len = 3
+    first_q_len = prompt_len + IMAGE_TOKEN_LEN
+    first_k, first_v = _make_known_kv(first_q_len)
+
+    _call_mgr(
+        mgr,
+        bs=1,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=first_k,
+        value_flat=first_v,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(1, prompt_len),
+    )
+    assert not mgr.attn.last_metadata.extra["sol_attn_enabled"]
+
+    update_k, update_v = _make_known_kv(IMAGE_TOKEN_LEN, base=100.0)
+    _call_mgr(
+        mgr,
+        bs=1,
+        q_len=IMAGE_TOKEN_LEN,
+        seq_len=prompt_len + IMAGE_TOKEN_LEN,
+        key_flat=update_k,
+        value_flat=update_v,
+        first_step=False,
+        position_ids=torch.arange(prompt_len, prompt_len + IMAGE_TOKEN_LEN).reshape(1, -1),
+    )
+    extra = mgr.attn.last_metadata.extra
+    assert extra["sol_attn_enabled"]
+    assert extra["sol_attn_prefix_len"] == prompt_len
+    assert extra["sol_attn_query_offset"] == prompt_len
 
 
 # ============================================================
