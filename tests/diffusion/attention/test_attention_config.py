@@ -89,6 +89,17 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match="only supported by the SOL_ATTN"):
             AttentionSpec(backend="FLASH_ATTN", sol_attn={"tau": 1.2})
 
+    def test_sla_attn_config_serialized(self):
+        spec = AttentionSpec(
+            backend="SLA_ATTN",
+            sla_attn={"kernel": "triton", "sparsity": 0.9, "blkq": 64, "blkk": 128},
+        )
+        assert spec.backend_kwargs() == {"kernel": "triton", "sparsity": 0.9, "blkq": 64, "blkk": 128}
+
+    def test_sla_attn_config_rejected_on_other_backend(self):
+        with pytest.raises(ValueError, match="only supported by the SLA_ATTN"):
+            AttentionSpec(backend="FLASH_ATTN", sla_attn={"sparsity": 0.9})
+
     @pytest.mark.parametrize(
         "spec, match",
         [
@@ -133,6 +144,19 @@ class TestAttentionConfig:
         spec, _ = config.resolve_with_source(role="hunyuan_image")
         assert spec.backend == "SOL_ATTN"
         assert spec.backend_kwargs() == {"tau": 1.0, "max_exact_blocks": 32, "compile": True}
+
+    def test_constructor_accepts_sla_attn_role_config(self):
+        config = AttentionConfig(
+            per_role={
+                "hunyuan_image": {
+                    "backend": "SLA_ATTN",
+                    "sla_attn": {"kernel": "ascendc", "sparsity": 0.9, "blkq": 128, "blkk": 128},
+                }
+            }
+        )
+        spec, _ = config.resolve_with_source(role="hunyuan_image")
+        assert spec.backend == "SLA_ATTN"
+        assert spec.backend_kwargs() == {"kernel": "ascendc", "sparsity": 0.9, "blkq": 128, "blkk": 128}
 
     def test_constructor_flattens_nested_per_role_tree(self):
         config = AttentionConfig(

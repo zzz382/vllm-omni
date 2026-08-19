@@ -38,6 +38,10 @@ class MockAttention(nn.Module):
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
         self.last_metadata = attn_metadata
+        if attn_metadata is not None and attn_metadata.joint_query is not None:
+            if attn_metadata.joint_strategy == "front":
+                return torch.cat([attn_metadata.joint_query, query], dim=1)
+            return torch.cat([query, attn_metadata.joint_query], dim=1)
         return query
 
 
@@ -207,6 +211,7 @@ def test_sol_attn_metadata_only_enables_after_prompt_kv_reuse():
         first_step=True,
         gen_timestep_scatter_index=_gen_timestep_index(1, prompt_len),
     )
+    assert not mgr.attn.last_metadata.extra["sparse_attn_enabled"]
     assert not mgr.attn.last_metadata.extra["sol_attn_enabled"]
 
     update_k, update_v = _make_known_kv(IMAGE_TOKEN_LEN, base=100.0)
@@ -221,9 +226,45 @@ def test_sol_attn_metadata_only_enables_after_prompt_kv_reuse():
         position_ids=torch.arange(prompt_len, prompt_len + IMAGE_TOKEN_LEN).reshape(1, -1),
     )
     extra = mgr.attn.last_metadata.extra
+    assert extra["sparse_attn_enabled"]
     assert extra["sol_attn_enabled"]
     assert extra["sol_attn_prefix_len"] == prompt_len
     assert extra["sol_attn_query_offset"] == prompt_len
+
+
+def test_sparse_attn_metadata_supports_ulysses_after_prompt_kv_reuse():
+    """Ulysses reshards the image sequence before the local SLA kernel runs."""
+    mgr = _make_cache_mgr(sp_size=2)
+    prompt_len = 3
+    shard_image_len = 4
+    first_q_len = prompt_len + shard_image_len
+    first_k, first_v = _make_known_kv(first_q_len)
+
+    _call_mgr(
+        mgr,
+        bs=1,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=first_k,
+        value_flat=first_v,
+        first_step=True,
+        shard_image_size=shard_image_len,
+        gen_timestep_scatter_index=_gen_timestep_index(1, prompt_len),
+    )
+    assert not mgr.attn.last_metadata.extra["sparse_attn_enabled"]
+
+    update_k, update_v = _make_known_kv(shard_image_len, base=100.0)
+    _call_mgr(
+        mgr,
+        bs=1,
+        q_len=shard_image_len,
+        seq_len=prompt_len + shard_image_len,
+        key_flat=update_k,
+        value_flat=update_v,
+        first_step=False,
+        shard_image_size=shard_image_len,
+    )
+    assert mgr.attn.last_metadata.extra["sparse_attn_enabled"]
 
 
 # ============================================================

@@ -1184,12 +1184,14 @@ class ImageKVCacheManager:
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
                 extra={
+                    "sparse_attn_enabled": sol_enabled,
                     "sol_attn_enabled": sol_enabled,
                     "sol_attn_prefix_len": prefix_len,
                     "sol_attn_query_offset": prefix_len,
                 },
             )
         else:
+            sparse_enabled = not first_step and not uncond_cfg_prefill and joint_text_key.shape[1] > 0
             attn_metadata = AttentionMetadata(
                 joint_query=joint_text_query,
                 joint_key=joint_text_key,
@@ -1197,6 +1199,7 @@ class ImageKVCacheManager:
                 joint_strategy="front",
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                extra={"sparse_attn_enabled": sparse_enabled},
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)

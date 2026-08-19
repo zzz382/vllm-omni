@@ -1463,6 +1463,7 @@ class AttentionSpec:
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
     sol_attn: dict[str, Any] | None = None
+    sla_attn: dict[str, Any] | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -1481,6 +1482,17 @@ class AttentionSpec:
             unknown = set(self.sol_attn) - allowed
             if unknown:
                 raise ValueError(f"Unknown sol_attn options: {sorted(unknown)}")
+        if self.sla_attn is not None:
+            if self.backend.upper() != "SLA_ATTN":
+                raise ValueError(
+                    f"sla_attn is only supported by the SLA_ATTN backend, but backend={self.backend!r}."
+                )
+            if not isinstance(self.sla_attn, Mapping):
+                raise TypeError(f"Expected dict for sla_attn, got {type(self.sla_attn)!r}")
+            allowed = {"sparsity", "kernel", "blkq", "blkk"}
+            unknown = set(self.sla_attn) - allowed
+            if unknown:
+                raise ValueError(f"Unknown sla_attn options: {sorted(unknown)}")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -1525,6 +1537,8 @@ class AttentionSpec:
             kw["quant"] = quant_kw
         if self.sol_attn is not None:
             kw.update(self.sol_attn)
+        if self.sla_attn is not None:
+            kw.update(self.sla_attn)
         return kw or None
 
 
@@ -1594,7 +1608,7 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant", "sol_attn"}
+        spec_keys = {"backend", "skip_softmax", "quant", "sol_attn", "sla_attn"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:
