@@ -228,6 +228,7 @@ class SolAttnImpl(AttentionImpl):
             tau=self.tau,
             prefix_len=prefix_len,
             query_offset=query_offset,
+            max_exact_blocks=self.max_exact_blocks,
         )
 
     def forward_cuda(self, query, key, value, attn_metadata=None):

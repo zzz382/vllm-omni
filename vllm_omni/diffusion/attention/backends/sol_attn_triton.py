@@ -43,7 +43,18 @@ def _prepare_summaries(
     tau: float,
     scale: float,
     block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    prefix_len: int,
+    query_offset: int,
+    max_exact_blocks: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    bool,
+]:
     """Build pooled K/V and per-query-block routing thresholds.
 
     This is deliberately expressed with regular accelerator tensor operations.  The
@@ -84,6 +95,21 @@ def _prepare_summaries(
     # same log2 domain as the kernel's scaled dot products.
     threshold = (mean + float(tau) * torch.sqrt(variance + 1.0e-6)) * 1.4426950408889634
 
+    # Route blocks eagerly.  Passing fixed-size selected indices to Triton
+    # avoids the dynamic boolean-to-pointer lowering that Triton-Ascend does
+    # not currently implement.
+    k_indices = torch.arange(k_blocks, device=query.device)
+    q_global = query_offset + torch.arange(q_blocks, device=query.device) * block_size
+    local = (q_global[:, None] - k_indices[None, :] * block_size).abs() <= block_size
+    sink = k_indices * block_size < prefix_len
+    route = proxy > (threshold[..., None] / 1.4426950408889634)
+    route = route | local[None, :, None, :] | sink[None, None, None, :]
+    capacity = min(int(max_exact_blocks), k_blocks)
+    route_scores = torch.where(route, proxy, torch.full_like(proxy, float("-inf")))
+    selected_scores, selected_indices = torch.topk(route_scores, capacity, dim=-1)
+    selected_valid = torch.isfinite(selected_scores)
+    overflow = bool((route.sum(dim=-1).amax() > capacity).item())
+
     # The kernel walks groups of 32 summaries and intentionally loads the
     # final group without a dynamic shape.  Pad summaries with zeros; invalid
     # blocks are excluded by the ``block_indices < NK`` predicate in the
@@ -93,7 +119,23 @@ def _prepare_summaries(
     vc_out = torch.zeros_like(kc_out)
     kc_out[:, :k_blocks] = kc.to(key.dtype)
     vc_out[:, :k_blocks] = vc.to(value.dtype)
-    return kc_out, vc_out, threshold.to(torch.float32)
+    route_mask = torch.zeros(
+        (batch, q_blocks, heads, summary_blocks),
+        device=query.device,
+        dtype=torch.float32,
+    )
+    route_mask[:, :, :, :k_blocks] = route.to(torch.float32)
+    selected_indices = selected_indices.to(torch.int32)
+    selected_valid = selected_valid.to(torch.float32)
+    return (
+        kc_out,
+        vc_out,
+        threshold.to(torch.float32),
+        selected_indices,
+        selected_valid,
+        route_mask,
+        overflow,
+    )
 
 
 if triton is not None:
@@ -231,6 +273,117 @@ if triton is not None:
         )
 
 
+    @triton.jit
+    def _forward_compact(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        kc_ptr,
+        vc_ptr,
+        threshold_ptr,
+        selected_ptr,
+        selected_valid_ptr,
+        route_ptr,
+        out_ptr,
+        scale,
+        TQ,
+        TK,
+        QSTRIDE,
+        NPAD,
+        ROUTE_STRIDE,
+        H: tl.constexpr,
+        D: tl.constexpr,
+        NQ: tl.constexpr,
+        NK: tl.constexpr,
+        R: tl.constexpr,
+        BV: tl.constexpr,
+        BLOCK: tl.constexpr,
+        GROUP: tl.constexpr,
+    ):
+        """Static-index Sol-Attn kernel for Triton-Ascend.
+
+        Routing is computed by PyTorch and represented by fixed-size index
+        tensors.  The kernel contains no dynamic predicate-to-pointer select.
+        """
+
+        v_tile, q_block, batch_head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        batch, head = batch_head // H, batch_head % H
+        offsets = tl.arange(0, BLOCK)
+        dims = tl.arange(0, D)
+        value_dims = v_tile * BV + tl.arange(0, BV)
+        q_tokens = q_block * BLOCK + offsets
+        q_valid = q_tokens < TQ
+        q_offsets = ((batch * QSTRIDE + q_tokens[:, None]) * H + head) * D + dims[None, :]
+        q = tl.load(
+            q_ptr + q_offsets,
+            mask=tl.broadcast_to(q_valid[:, None], (BLOCK, D)),
+            other=0.0,
+        )
+        output = tl.zeros((BLOCK, BV), dtype=tl.float32)
+        row_sum = tl.zeros((BLOCK,), dtype=tl.float32)
+        row_max = tl.zeros((BLOCK,), dtype=tl.float32)
+        scale_log2 = scale * 1.4426950408889634
+        threshold = tl.load(threshold_ptr + (batch * NQ + q_block) * H + head)
+        route_base = ((batch * NQ + q_block) * H + head) * ROUTE_STRIDE
+        selected_base = ((batch * NQ + q_block) * H + head) * R
+        group_offsets = tl.arange(0, GROUP)
+
+        for group_start in range(0, NK, GROUP):
+            block_indices = group_start + group_offsets
+            valid = block_indices < NK
+            kc_offsets = ((batch * NPAD + block_indices[:, None]) * H + head) * D + dims[None, :]
+            vc_offsets = ((batch * NPAD + block_indices[:, None]) * H + head) * D + value_dims[None, :]
+            summary_mask = tl.broadcast_to(valid[:, None], (GROUP, D))
+            value_mask = tl.broadcast_to(valid[:, None], (GROUP, BV))
+            kc = tl.load(kc_ptr + kc_offsets, mask=summary_mask, other=0.0)
+            vc = tl.load(vc_ptr + vc_offsets, mask=value_mask, other=0.0)
+            route = tl.load(route_ptr + route_base + block_indices, mask=valid, other=0.0)
+            approximate_mask = (1.0 - route) * valid.to(tl.float32)
+            scores = tl.dot(q, kc.T).to(tl.float32) * scale_log2
+            safe_scores = scores * approximate_mask[None, :] + (-1.0e9) * (1.0 - approximate_mask[None, :])
+            new_max = tl.maximum(row_max, tl.max(safe_scores, axis=1))
+            alpha = tl.math.exp2(row_max - new_max)
+            probability = tl.math.exp2(safe_scores - new_max[:, None]) * approximate_mask[None, :]
+            output = output * alpha[:, None] + tl.dot(probability.to(vc.dtype), vc)
+            lengths = tl.minimum(BLOCK, tl.maximum(0, TK - block_indices * BLOCK)).to(tl.float32)
+            row_sum = row_sum * alpha + tl.sum(probability * lengths[None, :], axis=1)
+            row_max = new_max
+
+        for rank in range(R):
+            block = tl.load(selected_ptr + selected_base + rank)
+            selected = tl.load(selected_valid_ptr + selected_base + rank)
+            kv_tokens = block * BLOCK + offsets
+            kv_valid = (kv_tokens < TK) & (selected > 0.0)
+            k_offsets = ((batch * TK + kv_tokens[:, None]) * H + head) * D + dims[None, :]
+            k = tl.load(
+                k_ptr + k_offsets,
+                mask=tl.broadcast_to(kv_valid[:, None], (BLOCK, D)),
+                other=0.0,
+            )
+            valid_mask = tl.broadcast_to(kv_valid[None, :], (BLOCK, BLOCK)).to(tl.float32)
+            exact_scores = tl.dot(q, k.T).to(tl.float32) * scale_log2
+            exact_scores = exact_scores * valid_mask + (-1.0e9) * (1.0 - valid_mask)
+            new_max = tl.maximum(row_max, tl.max(exact_scores, axis=1))
+            alpha = tl.math.exp2(row_max - new_max)
+            exact_probability = tl.math.exp2(exact_scores - new_max[:, None]) * selected
+            row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
+            v_offsets = ((batch * TK + kv_tokens[:, None]) * H + head) * D + value_dims[None, :]
+            v = tl.load(
+                v_ptr + v_offsets,
+                mask=tl.broadcast_to(kv_valid[:, None], (BLOCK, BV)),
+                other=0.0,
+            )
+            output = output * alpha[:, None] + tl.dot(exact_probability.to(v.dtype), v)
+            row_max = new_max
+
+        out_offsets = ((batch * QSTRIDE + q_tokens[:, None]) * H + head) * D + value_dims[None, :]
+        tl.store(
+            out_ptr + out_offsets,
+            (output / row_sum[:, None]).to(tl.bfloat16),
+            mask=tl.broadcast_to(q_valid[:, None], (BLOCK, BV)),
+        )
+
+
 def sol_attn(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -240,6 +393,7 @@ def sol_attn(
     tau: float = 1.0,
     prefix_len: int = 0,
     query_offset: int = 0,
+    max_exact_blocks: int = 32,
 ) -> torch.Tensor:
     """Run rectangular Triton Sol-Attn for BF16 BTHD tensors."""
 
@@ -267,30 +421,44 @@ def sol_attn(
     k_tokens = key.shape[1]
     q_blocks = (q_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
     k_blocks = (k_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
-    kc, vc, threshold = _prepare_summaries(
-        query, key, value, tau=tau, scale=scale, block_size=BLOCK_SIZE
+    kc, vc, threshold, selected, selected_valid, route, overflow = _prepare_summaries(
+        query,
+        key,
+        value,
+        tau=tau,
+        scale=scale,
+        block_size=BLOCK_SIZE,
+        prefix_len=prefix_len,
+        query_offset=query_offset,
+        max_exact_blocks=max_exact_blocks,
     )
+    if overflow:
+        raise RuntimeError(
+            "Sol-Attn Triton route overflow: increase max_exact_blocks or use kernel=torch"
+        )
     output = torch.empty_like(query)
-    _forward_rect[(1, q_blocks, batch * heads)](
+    _forward_compact[(1, q_blocks, batch * heads)](
         query,
         key,
         value,
         kc,
         vc,
         threshold,
+        selected,
+        selected_valid,
+        route,
         output,
         float(scale),
         q_tokens,
         k_tokens,
         q_tokens,
         kc.shape[1],
-        int(query_offset),
-        int(prefix_len),
-        HAS_SINK=prefix_len > 0,
+        route.shape[-1],
         H=heads,
         D=dim,
         NQ=q_blocks,
         NK=k_blocks,
+        R=selected.shape[-1],
         BV=dim,
         BLOCK=BLOCK_SIZE,
         GROUP=GROUP_SIZE,
