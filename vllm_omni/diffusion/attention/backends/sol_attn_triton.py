@@ -131,12 +131,19 @@ if triton is not None:
         q_tokens = q_block * BLOCK + offsets
         q_valid = q_tokens < TQ
         q_offsets = ((batch * QSTRIDE + q_tokens[:, None]) * H + head) * D + dims[None, :]
-        q = tl.load(q_ptr + q_offsets, mask=q_valid[:, None], other=0.0)
+        q = tl.load(
+            q_ptr + q_offsets,
+            mask=tl.broadcast_to(q_valid[:, None], (BLOCK, D)),
+            other=0.0,
+        )
         q_len = tl.minimum(BLOCK, TQ - q_block * BLOCK).to(tl.float32)
 
         output = tl.zeros((BLOCK, BV), dtype=tl.float32)
         row_sum = tl.zeros((BLOCK,), dtype=tl.float32)
-        row_max = tl.full((BLOCK,), -float("inf"), tl.float32)
+        # Start at zero instead of -inf.  This keeps the no-approximation
+        # path finite and avoids scalar-condition tl.where lowering, which is
+        # currently unsupported by Triton-Ascend's BlockPtrAnalysis.
+        row_max = tl.zeros((BLOCK,), dtype=tl.float32)
         scale_log2 = scale * 1.4426950408889634
         route_threshold = tl.load(threshold_ptr + (batch * NQ + q_block) * H + head)
 
@@ -146,8 +153,16 @@ if triton is not None:
             valid = block_indices < NK
             kc_offsets = ((batch * NPAD + block_indices[:, None]) * H + head) * D + dims[None, :]
             vc_offsets = ((batch * NPAD + block_indices[:, None]) * H + head) * D + value_dims[None, :]
-            kc = tl.load(kc_ptr + kc_offsets, mask=valid[:, None], other=0.0)
-            vc = tl.load(vc_ptr + vc_offsets, mask=valid[:, None], other=0.0)
+            kc = tl.load(
+                kc_ptr + kc_offsets,
+                mask=tl.broadcast_to(valid[:, None], (GROUP, D)),
+                other=0.0,
+            )
+            vc = tl.load(
+                vc_ptr + vc_offsets,
+                mask=tl.broadcast_to(valid[:, None], (GROUP, BV)),
+                other=0.0,
+            )
             scores = tl.dot(q, kc.T).to(tl.float32) * scale_log2
             q_global_start = query_offset + q_block * BLOCK
             k_starts = block_indices * BLOCK
@@ -158,41 +173,56 @@ if triton is not None:
             exact = exact & valid
 
             approximate = valid & ~exact
-            has_approximate = tl.sum(approximate.to(tl.int32), axis=0) > 0
-            approximate_scores = tl.where(approximate[None, :], scores, -float("inf"))
-            safe_scores = tl.where(has_approximate, approximate_scores, 0.0)
-            new_max = tl.where(has_approximate, tl.maximum(row_max, tl.max(safe_scores, axis=1)), row_max)
-            alpha = tl.math.exp2(tl.where(has_approximate, row_max - new_max, 0.0))
-            probability = tl.math.exp2(safe_scores - tl.where(has_approximate, new_max, 0.0)[:, None])
-            probability = tl.where(has_approximate & approximate[None, :], probability, 0.0)
+            approximate_mask = approximate[None, :].to(tl.float32)
+            # Use a finite sentinel and arithmetic masks instead of
+            # broadcasting tl.where over [BLOCK, GROUP].  Triton-Ascend's
+            # current BlockPtrAnalysis rejects that select shape.
+            safe_scores = scores * approximate_mask + (-1.0e9) * (1.0 - approximate_mask)
+            new_max = tl.maximum(row_max, tl.max(safe_scores, axis=1))
+            alpha = tl.math.exp2(row_max - new_max)
+            probability = tl.math.exp2(safe_scores - new_max[:, None]) * approximate_mask
             output = output * alpha[:, None] + tl.dot(probability.to(vc.dtype), vc)
             lengths = tl.minimum(BLOCK, tl.maximum(0, TK - k_starts)).to(tl.float32)
             row_sum = row_sum * alpha + tl.sum(probability * lengths[None, :], axis=1)
             row_max = new_max
 
-            exact_offsets = tl.where(exact, group_offsets, GROUP)
+            exact_offsets = exact.to(tl.int32) * group_offsets + (~exact).to(tl.int32) * GROUP
             num_exact = tl.sum(exact.to(tl.int32), axis=0)
             for _ in range(num_exact):
                 offset = tl.min(exact_offsets)
                 block = group_start + offset
-                exact_offsets = tl.where(group_offsets == offset, GROUP, exact_offsets)
+                replaced = (group_offsets == offset).to(tl.int32)
+                exact_offsets = replaced * GROUP + (1 - replaced) * exact_offsets
                 kv_tokens = block * BLOCK + offsets
                 kv_valid = kv_tokens < TK
                 k_offsets = ((batch * TK + kv_tokens[:, None]) * H + head) * D + dims[None, :]
-                k = tl.load(k_ptr + k_offsets, mask=kv_valid[:, None], other=0.0)
+                k = tl.load(
+                    k_ptr + k_offsets,
+                    mask=tl.broadcast_to(kv_valid[:, None], (BLOCK, D)),
+                    other=0.0,
+                )
                 exact_scores = tl.dot(q, k.T).to(tl.float32) * scale_log2
-                exact_scores += tl.where(kv_valid[None, :], 0.0, -float("inf"))
+                valid_mask = kv_valid[None, :].to(tl.float32)
+                exact_scores = exact_scores * valid_mask + (-1.0e9) * (1.0 - valid_mask)
                 new_max = tl.maximum(row_max, tl.max(exact_scores, axis=1))
                 alpha = tl.math.exp2(row_max - new_max)
                 exact_probability = tl.math.exp2(exact_scores - new_max[:, None])
                 row_sum = row_sum * alpha + tl.sum(exact_probability, axis=1)
                 v_offsets = ((batch * TK + kv_tokens[:, None]) * H + head) * D + value_dims[None, :]
-                v = tl.load(v_ptr + v_offsets, mask=kv_valid[:, None], other=0.0)
+                v = tl.load(
+                    v_ptr + v_offsets,
+                    mask=tl.broadcast_to(kv_valid[:, None], (BLOCK, BV)),
+                    other=0.0,
+                )
                 output = output * alpha[:, None] + tl.dot(exact_probability.to(v.dtype), v)
                 row_max = new_max
 
         out_offsets = ((batch * QSTRIDE + q_tokens[:, None]) * H + head) * D + value_dims[None, :]
-        tl.store(out_ptr + out_offsets, (output / row_sum[:, None]).to(tl.bfloat16), mask=q_valid[:, None])
+        tl.store(
+            out_ptr + out_offsets,
+            (output / row_sum[:, None]).to(tl.bfloat16),
+            mask=tl.broadcast_to(q_valid[:, None], (BLOCK, BV)),
+        )
 
 
 def sol_attn(
