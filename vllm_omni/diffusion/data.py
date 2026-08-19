@@ -1477,7 +1477,7 @@ class AttentionSpec:
                 )
             if not isinstance(self.sol_attn, Mapping):
                 raise TypeError(f"Expected dict for sol_attn, got {type(self.sol_attn)!r}")
-            allowed = {"tau", "max_exact_blocks", "compile"}
+            allowed = {"tau", "max_exact_blocks", "compile", "kernel"}
             unknown = set(self.sol_attn) - allowed
             if unknown:
                 raise ValueError(f"Unknown sol_attn options: {sorted(unknown)}")

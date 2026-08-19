@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Torch-compiled Sol-Attn reference backend.
+"""Sol-Attn backend with optional Triton and torch.compile implementations.
 
-This implementation is intentionally expressed with regular PyTorch tensor
-operations so it can be lowered by ``torch.compile`` on Ascend NPU.  It is a
-correctness-first backend; a fused Ascend kernel can replace the function
-without changing the metadata contract.
+The fused rectangular Triton kernel is adapted from Sana's reference
+implementation.  On Ascend it is loaded through ``vllm.triton_utils``; the
+torch.compile implementation remains a safe fallback for older CANN images.
 """
 
 from __future__ import annotations
@@ -145,7 +144,7 @@ def _compiled_sol_attn():
 
 class SolAttnBackend(AttentionBackend):
     accept_output_buffer = True
-    supported_platforms = ("npu",)
+    supported_platforms = ("npu", "cuda")
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -167,7 +166,7 @@ class SolAttnBackend(AttentionBackend):
 
 
 class SolAttnImpl(AttentionImpl):
-    """NPU Sol-Attn using a torch.compile-lowered reference implementation."""
+    """Sol-Attn with a Triton fast path and compiled PyTorch fallback."""
 
     def __init__(
         self,
@@ -193,6 +192,12 @@ class SolAttnImpl(AttentionImpl):
         self.block_size = int(kwargs.get("block_size", _BLOCK_SIZE))
         self.max_exact_blocks = int(kwargs.get("max_exact_blocks", _DEFAULT_MAX_EXACT_BLOCKS))
         self.compile_enabled = bool(kwargs.get("compile", True))
+        # ``auto`` tries the vLLM Triton shim on both CUDA and Ascend NPU.
+        # Explicit ``torch`` is useful for correctness comparisons; explicit
+        # ``triton`` raises if the target runtime cannot compile the kernel.
+        self.kernel = str(kwargs.get("kernel", "auto")).lower()
+        if self.kernel not in ("auto", "torch", "triton"):
+            raise ValueError("SOL_ATTN kernel must be one of: auto, torch, triton")
         if self.block_size != _BLOCK_SIZE:
             raise ValueError(f"SOL_ATTN currently requires block_size={_BLOCK_SIZE}, got {self.block_size}")
         if self.max_exact_blocks < 1:
@@ -207,8 +212,61 @@ class SolAttnImpl(AttentionImpl):
             qkv_layout=qkv_layout,
         )
 
+    def _forward_triton(self, query, key, value, prefix_len, query_offset):
+        from vllm_omni.diffusion.attention.backends.sol_attn_triton import (
+            is_available,
+            sol_attn as triton_sol_attn,
+        )
+
+        if not is_available():
+            raise RuntimeError("Triton runtime is unavailable")
+        return triton_sol_attn(
+            query,
+            key,
+            value,
+            scale=self.softmax_scale,
+            tau=self.tau,
+            prefix_len=prefix_len,
+            query_offset=query_offset,
+        )
+
     def forward_cuda(self, query, key, value, attn_metadata=None):
-        return self.dense_fallback.forward_cuda(query, key, value, attn_metadata)
+        extra = attn_metadata.extra if attn_metadata is not None else {}
+        if not extra.get("sol_attn_enabled", False):
+            return self.dense_fallback.forward_cuda(query, key, value, attn_metadata)
+        if query.ndim != 4 or key.ndim != 4 or value.shape != key.shape:
+            return self.dense_fallback.forward_cuda(query, key, value, attn_metadata)
+        if query.shape[0] != key.shape[0] or query.shape[2:] != key.shape[2:]:
+            return self.dense_fallback.forward_cuda(query, key, value, attn_metadata)
+        if query.shape[-1] != _HEAD_DIM or query.shape[1] < _MIN_TOKENS:
+            return self.dense_fallback.forward_cuda(query, key, value, attn_metadata)
+        prefix_len = int(extra.get("sol_attn_prefix_len", max(key.shape[1] - query.shape[1], 0)))
+        query_offset = int(extra.get("sol_attn_query_offset", prefix_len))
+        if self.kernel != "torch":
+            try:
+                return self._forward_triton(query, key, value, prefix_len, query_offset)
+            except Exception:
+                if self.kernel == "triton":
+                    raise
+        # CUDA torch fallback is also useful for validating the Triton result.
+        try:
+            fn = _compiled_sol_attn() if self.compile_enabled else _sol_attn_torch_impl
+            output, overflow = fn(
+                query,
+                key,
+                value,
+                self.softmax_scale,
+                self.tau,
+                self.block_size,
+                self.max_exact_blocks,
+                prefix_len,
+                query_offset,
+            )
+            if bool(overflow.item()):
+                return self.dense_fallback.forward_cuda(query, key, value, attn_metadata)
+            return output
+        except Exception:
+            return self.dense_fallback.forward_cuda(query, key, value, attn_metadata)
 
     def forward_xpu(self, query, key, value, attn_metadata=None):
         return self.dense_fallback.forward_xpu(query, key, value, attn_metadata)
@@ -225,6 +283,12 @@ class SolAttnImpl(AttentionImpl):
             return self.dense_fallback.forward_npu(query, key, value, attn_metadata)
         prefix_len = int(extra.get("sol_attn_prefix_len", max(key.shape[1] - query.shape[1], 0)))
         query_offset = int(extra.get("sol_attn_query_offset", prefix_len))
+        if self.kernel != "torch":
+            try:
+                return self._forward_triton(query, key, value, prefix_len, query_offset)
+            except Exception:
+                if self.kernel == "triton":
+                    raise
         try:
             fn = _compiled_sol_attn() if self.compile_enabled else _sol_attn_torch_impl
             output, overflow = fn(
