@@ -186,13 +186,19 @@ if triton is not None:
             row_sum = row_sum * alpha + tl.sum(probability * lengths[None, :], axis=1)
             row_max = new_max
 
-            exact_offsets = exact.to(tl.int32) * group_offsets + (~exact).to(tl.int32) * GROUP
+            # Keep the predicate as a Triton select.  Casting this bool vector
+            # to int and feeding it into pointer arithmetic triggers
+            # Triton-Ascend's unsupported AddPtrOp lowering.
+            exact_offsets = tl.where(exact, group_offsets, GROUP)
             num_exact = tl.sum(exact.to(tl.int32), axis=0)
             for _ in range(num_exact):
                 offset = tl.min(exact_offsets)
                 block = group_start + offset
-                replaced = (group_offsets == offset).to(tl.int32)
-                exact_offsets = replaced * GROUP + (1 - replaced) * exact_offsets
+                exact_offsets = tl.where(
+                    group_offsets == offset,
+                    GROUP,
+                    exact_offsets,
+                )
                 kv_tokens = block * BLOCK + offsets
                 kv_valid = kv_tokens < TK
                 k_offsets = ((batch * TK + kv_tokens[:, None]) * H + head) * D + dims[None, :]
