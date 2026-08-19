@@ -217,8 +217,15 @@ def sol_attn(
         raise ValueError("Triton Sol-Attn requires contiguous BF16 head_dim=128 tensors")
     if key.device != query.device or value.device != query.device:
         raise ValueError("Triton Sol-Attn requires tensors on the same device")
-    if not (query.is_contiguous() and key.is_contiguous() and value.is_contiguous()):
-        raise ValueError("Triton Sol-Attn requires contiguous BTHD tensors")
+    # Hunyuan's Q/K/V are commonly produced by transpose/reshape views.  The
+    # pointer kernel uses the packed BTHD address formula, so materialize only
+    # non-contiguous inputs here; the normal contiguous path remains zero-copy.
+    if not query.is_contiguous():
+        query = query.contiguous()
+    if not key.is_contiguous():
+        key = key.contiguous()
+    if not value.is_contiguous():
+        value = value.contiguous()
 
     batch, q_tokens, heads, dim = query.shape
     k_tokens = key.shape[1]
