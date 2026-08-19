@@ -496,7 +496,15 @@ class HunyuanImage3Pipeline(
             self,
             skip_prefixes=skip_prefixes,
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        # SLA is an optional post-training branch.  Base Hunyuan checkpoints
+        # legitimately omit these zero-initialized parameters; when present,
+        # AutoWeightsLoader still loads them normally.  Marking the optional
+        # names as covered keeps the generic strict loader compatible with both
+        # base and converted (SLA-augmented) DiT safetensors directories.
+        if loaded is not None:
+            loaded.update(name for name, _ in self.named_parameters() if ".sla.proj_l." in name)
+        return loaded
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed

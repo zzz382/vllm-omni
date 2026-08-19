@@ -5,10 +5,9 @@ The routing and sparse kernels are adapted from FastVideo's NPU SLA backend.
 Hunyuan Image 3 reuses a prompt KV prefix after the first denoising step, so
 the accelerator implementation supports rectangular attention (``LQ != LK``).
 
-This inference backend intentionally implements the SLA sparse branch only.
-The trainable linear compensation branch from the SLA paper requires model
-specific ``proj_l`` weights, which the original Hunyuan Image 3 checkpoint
-does not contain.
+The sparse kernel remains the accelerator-specific part of this backend.  The
+Hunyuan Image 3 model owns the registered ``proj_l`` compensation module and
+adds its linear branch after this implementation returns.
 """
 
 from __future__ import annotations
@@ -91,7 +90,7 @@ class SLAAttentionBackend(AttentionBackend):
 
 
 class SLAAttentionImpl(AttentionImpl):
-    """Forward-only SLA block-sparse attention for Ascend NPU."""
+    """SLA block-sparse attention for Ascend NPU."""
 
     def __init__(
         self,
@@ -115,6 +114,9 @@ class SLAAttentionImpl(AttentionImpl):
         self.softmax_scale = float(softmax_scale)
         self.qkv_layout = qkv_layout
         self.sparsity, self.kernel, self.blkq, self.blkk = _resolve_sla_config(backend_kwargs)
+        self.feature_map = str((backend_kwargs or {}).get("feature_map", "softmax")).lower()
+        if self.feature_map not in {"softmax", "elu", "relu"}:
+            raise ValueError("SLA_ATTN feature_map must be one of: softmax, elu, relu")
 
         self.dense_fallback = FlashAttentionBackend.get_impl_cls()(
             num_heads=num_heads,
@@ -125,6 +127,9 @@ class SLAAttentionImpl(AttentionImpl):
             prefix=prefix,
             qkv_layout=qkv_layout,
         )
+        # Model-specific Hunyuan modules can attach a registered linear
+        # compensation branch here.  The backend itself remains parameter-free.
+        self.linear_module = None
 
     @staticmethod
     def _sparse_enabled(attn_metadata: AttentionMetadata | None) -> bool:
@@ -230,6 +235,8 @@ class SLAAttentionImpl(AttentionImpl):
                     logger.warning("AscendC SLA_ATTN is unavailable; falling back to NPU Triton: %s", exc)
                     output = self._forward_triton(q, k, v, lut, topk)
 
+        if self.linear_module is not None:
+            output = output + self.linear_module.forward_bnsd(q, k, v)
         return output.transpose(1, 2).contiguous().to(query.dtype)
 
 

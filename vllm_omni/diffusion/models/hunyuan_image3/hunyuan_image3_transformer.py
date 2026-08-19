@@ -913,6 +913,67 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
+class HunyuanSLALinearAttention(nn.Module):
+    """Model-owned SLA linear compensation branch.
+
+    The sparse branch is executed by the selected NPU attention backend.  This
+    module mirrors MindSpeed-MM-SLA's feature-map linear attention and keeps
+    ``proj_l`` as a normal registered FP32 parameter so it can be loaded from
+    ``model.layers.*.self_attn.sla.proj_l.*`` safetensors keys.
+    """
+
+    def __init__(self, head_dim: int, feature_map: str = "softmax") -> None:
+        super().__init__()
+        self.feature_map = str(feature_map).lower()
+        if self.feature_map not in {"softmax", "elu", "relu"}:
+            raise ValueError("Hunyuan SLA feature_map must be one of: softmax, elu, relu")
+        self.proj_l = nn.Linear(head_dim, head_dim, bias=True, dtype=torch.float32)
+        with torch.no_grad():
+            self.proj_l.weight.zero_()
+            self.proj_l.bias.zero_()
+
+    def _map(self, x: torch.Tensor) -> torch.Tensor:
+        if self.feature_map == "elu":
+            return torch.nn.functional.elu(x) + 1.0
+        if self.feature_map == "relu":
+            return torch.relu(x)
+        return torch.softmax(x, dim=-1)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        # Inputs are BSND.
+        return self.forward_bnsd(
+            query.transpose(1, 2).contiguous(),
+            key.transpose(1, 2).contiguous(),
+            value.transpose(1, 2).contiguous(),
+        ).transpose(1, 2).contiguous()
+
+    def forward_bnsd(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # Expand GQA heads, then use the BNSD formulation from MindSpeed-MM-SLA.
+        input_dtype = q.dtype
+        compute_dtype = torch.bfloat16 if input_dtype == torch.bfloat16 else input_dtype
+        q = q.contiguous().to(compute_dtype)
+        k = k.contiguous().to(compute_dtype)
+        v = v.contiguous().to(compute_dtype)
+        if q.shape[1] != k.shape[1]:
+            if q.shape[1] % k.shape[1] != 0:
+                raise ValueError(f"GQA head counts are incompatible: q={q.shape}, k={k.shape}")
+            repeat = q.shape[1] // k.shape[1]
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
+        qf = self._map(q)
+        kf = self._map(k)
+        kv_sum = torch.matmul(kf.transpose(-1, -2), v)
+        k_sum = kf.sum(dim=-2, keepdim=True)
+        denom = (qf * k_sum).sum(dim=-1, keepdim=True).clamp_min(1.0e-5)
+        linear = torch.matmul(qf, kv_sum) / denom
+        # MindSpeed keeps proj_l weights in FP32 storage but executes the
+        # autocast projection in the SLA compute dtype (BF16 for Hunyuan).
+        proj_dtype = linear.dtype
+        proj_weight = self.proj_l.weight.to(proj_dtype)
+        proj_bias = self.proj_l.bias.to(proj_dtype) if self.proj_l.bias is not None else None
+        return torch.nn.functional.linear(linear, proj_weight, proj_bias).to(input_dtype)
+
+
 class ImageKVCacheManager:
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
@@ -926,6 +987,7 @@ class ImageKVCacheManager:
         scaling: float,
         image_token_len: int = 4097,
         prefix: str = "",
+        sla_module: nn.Module | None = None,
     ):
         """
         Args:
@@ -956,6 +1018,10 @@ class ImageKVCacheManager:
             role="hunyuan_image",
             qkv_layout="BSND",
         )
+        # The module is registered by HunYuanAttention; this plain cache
+        # manager only keeps a reference so it can apply the compensation to
+        # the exact post-cache Q/K/V tensors used by the sparse backend.
+        self.sla = sla_module
 
     @staticmethod
     def _get_current_starts(
@@ -1202,6 +1268,10 @@ class ImageKVCacheManager:
                 extra={"sparse_attn_enabled": sparse_enabled},
             )
         attn_output = self.attn(query, key, value, attn_metadata)
+        # SLA is sparse + linear.  The sparse accelerator implementation is
+        # deliberately kept in ``self.attn``; the model-specific proj_l branch
+        # is evaluated here after prompt-KV reuse and head expansion so it sees
+        # precisely the same tensors as the sparse branch.
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
 
@@ -1763,6 +1833,20 @@ class HunYuanAttention(nn.Module):
             image_token_len=4097,
             prefix=f"{prefix}.image_attn",
         )
+        image_backend = getattr(self.image_attn.attn, "attn_backend", None)
+        image_backend_name = image_backend.get_name() if image_backend is not None else None
+        if image_backend_name == "SLA_ATTN":
+            backend_impl = self.image_attn.attn.attention
+            self.sla = HunyuanSLALinearAttention(
+                self.head_dim,
+                feature_map=getattr(backend_impl, "feature_map", "softmax"),
+            )
+            self.image_attn.sla = self.sla
+            # The backend sees Q/K/V after Ulysses/Ring pre-processing, which
+            # is required for globally normalized linear attention under SP.
+            backend_impl.linear_module = self.sla
+        else:
+            self.sla = None
         self.image_rope2d_emb = HunYuanRotary2DEmbedder(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,

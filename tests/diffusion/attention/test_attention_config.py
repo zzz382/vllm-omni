@@ -96,6 +96,13 @@ class TestAttentionSpec:
         )
         assert spec.backend_kwargs() == {"kernel": "triton", "sparsity": 0.9, "blkq": 64, "blkk": 128}
 
+    def test_sla_feature_map_is_serialized(self):
+        spec = AttentionSpec(
+            backend="SLA_ATTN",
+            sla_attn={"kernel": "triton", "feature_map": "elu"},
+        )
+        assert spec.backend_kwargs()["feature_map"] == "elu"
+
     def test_sla_attn_config_rejected_on_other_backend(self):
         with pytest.raises(ValueError, match="only supported by the SLA_ATTN"):
             AttentionSpec(backend="FLASH_ATTN", sla_attn={"sparsity": 0.9})

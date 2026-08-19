@@ -1489,7 +1489,7 @@ class AttentionSpec:
                 )
             if not isinstance(self.sla_attn, Mapping):
                 raise TypeError(f"Expected dict for sla_attn, got {type(self.sla_attn)!r}")
-            allowed = {"sparsity", "kernel", "blkq", "blkk"}
+            allowed = {"sparsity", "kernel", "blkq", "blkk", "feature_map"}
             unknown = set(self.sla_attn) - allowed
             if unknown:
                 raise ValueError(f"Unknown sla_attn options: {sorted(unknown)}")
